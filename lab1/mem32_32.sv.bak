@@ -1,0 +1,9 @@
+module mem32_32(input logic clk, we, input logic adr[4:0], input logic wd[31:0], output logic rd[31:0]);
+  logic [31:0] RAM [31:0];
+  
+  assign rd = RAM[adr[4:0]];
+  
+  always_ff @(posedge clk)
+	if (we) RAM[adr[4:0]] <= wd;
+
+endmodule

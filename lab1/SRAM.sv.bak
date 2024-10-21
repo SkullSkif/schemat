@@ -1,0 +1,12 @@
+module sram (input logic clk, input logic [4:0] addr, output logic [31:0] out);
+	logic [31:0] SRAM [31:0];
+always @*
+begin
+	int i = 0;
+	for (; i < 32; i++)
+		begin
+			SRAM[i] = i;
+		end
+end
+	assign out = SRAM[addr[4:0]];
+endmodule

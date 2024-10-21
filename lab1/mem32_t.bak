@@ -1,0 +1,17 @@
+`timescale 1ns/1ps
+
+module mem32_t();
+  logic [31:0] in1;
+  logic [31:0] out1;
+  logic [5:0] a1;
+  logic we1, clk;
+  int w;
+  mem32 memtest(clk, we1, a1, in1, out1);
+  initial
+  begin
+      for(w = 0; w < 64;w++)
+      begin
+          assert(!out1) #error ("error, memory isnt trash"); : $error ("yeah, memory is trash");
+      end
+  end  
+endmodule
