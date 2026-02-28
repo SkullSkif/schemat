@@ -1,0 +1,323 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <string.h>
+
+// ============= НАСТРОЙКИ =============
+#define LCD_ADDR 0x27           // Адрес LCD
+#define BAUD_RATE 9600           // Скорость UART
+
+// Пины
+#define BUILTIN_LED PB5          // Встроенный LED на пине 13 (индикатор приема)
+#define EXTERNAL_LED_PORT PORTB  // Порт для внешнего LED (пин 8 это PB0)
+#define EXTERNAL_LED_DDR DDRB
+#define EXTERNAL_LED_PIN PB0      // Пин 8 соответствует PB0
+
+// ============= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =============
+// Буфер для UART
+#define UART_BUFFER_SIZE 64
+volatile uint8_t uart_rx_buffer[UART_BUFFER_SIZE];
+volatile uint8_t uart_rx_head = 0;
+volatile uint8_t uart_rx_tail = 0;
+volatile uint8_t uart_rx_count = 0;
+
+// Состояние внешнего светодиода
+volatile uint8_t external_led_state = 0;
+
+// Флаг, что команда обработана
+volatile uint8_t command_processed = 1;
+
+// Прототипы
+void uart_init(unsigned long baud);
+void uart_transmit(uint8_t data);
+void uart_send_string(const char* str);
+void uart_send_number(uint8_t num);
+
+void i2c_init(void);
+void i2c_start(void);
+void i2c_stop(void);
+void i2c_write(uint8_t data);
+
+void lcd_send_nibble(uint8_t nibble, uint8_t rs);
+void lcd_send_byte(uint8_t byte, uint8_t rs);
+void lcd_init(void);
+void lcd_set_cursor(uint8_t row, uint8_t col);
+void lcd_print(const char* str);
+void lcd_clear(void);
+
+void set_external_led(uint8_t state);
+void process_command(uint8_t cmd);
+void uart_send_prompt(void);
+
+// ============= I2C ФУНКЦИИ =============
+void i2c_init(void) {
+    TWBR = 72;  // 100 кГц при 16 МГц
+    TWSR = 0;
+}
+
+void i2c_start(void) {
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+}
+
+void i2c_stop(void) {
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+
+void i2c_write(uint8_t data) {
+    TWDR = data;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+}
+
+// ============= LCD ФУНКЦИИ (через I2C) =============
+void lcd_send_nibble(uint8_t nibble, uint8_t rs) {
+    uint8_t data = (nibble << 4) | (rs ? 0x01 : 0x00) | 0x08; // Backlight ON
+    i2c_start();
+    i2c_write(LCD_ADDR << 1);
+    i2c_write(data | 0x04);  // EN = 1
+    _delay_us(1);
+    i2c_write(data & ~0x04);  // EN = 0
+    i2c_stop();
+    _delay_us(50);
+}
+
+void lcd_send_byte(uint8_t byte, uint8_t rs) {
+    lcd_send_nibble(byte >> 4, rs);
+    lcd_send_nibble(byte & 0x0F, rs);
+}
+
+void lcd_init(void) {
+    _delay_ms(50);
+    
+    // Инициализация в 4-бит режиме
+    lcd_send_nibble(0x03, 0);
+    _delay_ms(5);
+    lcd_send_nibble(0x03, 0);
+    _delay_us(150);
+    lcd_send_nibble(0x03, 0);
+    _delay_us(150);
+    lcd_send_nibble(0x02, 0);  // Переход в 4-бит режим
+    
+    // Настройка дисплея
+    lcd_send_byte(0x28, 0);  // 4 бита, 2 строки
+    lcd_send_byte(0x0C, 0);  // Включить дисплей, без курсора
+    lcd_send_byte(0x06, 0);  // Автоинкремент адреса
+    lcd_send_byte(0x01, 0);  // Очистка
+    _delay_ms(2);
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    uint8_t addr = (row == 0) ? (0x00 + col) : (0x40 + col);
+    lcd_send_byte(0x80 | addr, 0);
+}
+
+void lcd_print(const char* str) {
+    while (*str) {
+        lcd_send_byte(*str++, 1);
+    }
+}
+
+void lcd_clear(void) {
+    lcd_send_byte(0x01, 0);
+    _delay_ms(2);
+}
+
+// ============= УПРАВЛЕНИЕ ВНЕШНИМ СВЕТОДИОДОМ =============
+void set_external_led(uint8_t state) {
+    if (state) {
+        EXTERNAL_LED_PORT |= (1 << EXTERNAL_LED_PIN);   // Включить
+    } else {
+        EXTERNAL_LED_PORT &= ~(1 << EXTERNAL_LED_PIN);  // Выключить
+    }
+    external_led_state = state;
+    
+    // Обновляем информацию на LCD
+    lcd_set_cursor(1, 8);  // Вторая строка, позиция 8
+    if (state) {
+        lcd_print("ON ");
+    } else {
+        lcd_print("OFF");
+    }
+}
+
+// ============= UART ФУНКЦИИ =============
+void uart_init(unsigned long baud) {
+    unsigned int ubrr = F_CPU / 16 / baud - 1;
+    UBRR0H = (unsigned char)(ubrr >> 8);
+    UBRR0L = (unsigned char)ubrr;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void uart_transmit(uint8_t data) {
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = data;
+}
+
+void uart_send_string(const char* str) {
+    while (*str) {
+        uart_transmit(*str++);
+    }
+}
+
+void uart_send_prompt(void) {
+    uart_send_string("\r\n> ");
+}
+
+// Обработчик UART
+ISR(USART_RX_vect) {
+    uint8_t data = UDR0;
+    uint8_t next_head = (uart_rx_head + 1) % UART_BUFFER_SIZE;
+    
+    // Игнорируем символы перевода строки и возврата каретки
+    if (data == '\r' || data == '\n') {
+        return;  // Не сохраняем их в буфер
+    }
+    
+    if (next_head != uart_rx_tail) {
+        uart_rx_buffer[uart_rx_head] = data;
+        uart_rx_head = next_head;
+        uart_rx_count++;
+    }
+}
+
+// ============= ОБРАБОТКА КОМАНД =============
+void process_command(uint8_t cmd) {
+    // Показываем команду на LCD
+    lcd_set_cursor(1, 0);
+    lcd_print("Cmd: ");
+    lcd_send_byte(cmd, 1);
+    lcd_print("   ");
+    
+    // Эхо команды в UART
+    uart_transmit(cmd);
+    
+    switch(cmd) {
+        case '1':
+            set_external_led(1);
+            lcd_set_cursor(0, 0);
+            lcd_print("LED: ON         ");
+            uart_send_string(" [ON]");
+            break;
+            
+        case '0':
+            set_external_led(0);
+            lcd_set_cursor(0, 0);
+            lcd_print("LED: OFF        ");
+            uart_send_string(" [OFF]");
+            break;
+            
+        case 's':
+        case 'S':
+            lcd_set_cursor(0, 0);
+            lcd_print("Status:         ");
+            lcd_set_cursor(0, 8);
+            if (external_led_state) {
+                lcd_print("ON ");
+                uart_send_string(" [Status: ON]");
+            } else {
+                lcd_print("OFF");
+                uart_send_string(" [Status: OFF]");
+            }
+            break;
+            
+        case 't':
+        case 'T':
+            set_external_led(!external_led_state);
+            lcd_set_cursor(0, 0);
+            if (external_led_state) {
+                lcd_print("LED: ON         ");
+            } else {
+                lcd_print("LED: OFF        ");
+            }
+            uart_send_string(" [Toggled]");
+            break;
+            
+        case 'h':
+        case 'H':
+        case '?':
+            uart_send_string("\r\n");
+            uart_send_string("╔════════════════════════╗\r\n");
+            uart_send_string("║        HELP MENU       ║\r\n");
+            uart_send_string("╠════════════════════════╣\r\n");
+            uart_send_string("║ 1 - LED ON             ║\r\n");
+            uart_send_string("║ 0 - LED OFF            ║\r\n");
+            uart_send_string("║ s - Show Status        ║\r\n");
+            uart_send_string("║ t - Toggle LED         ║\r\n");
+            uart_send_string("║ h/? - This help        ║\r\n");
+            uart_send_string("╚════════════════════════╝\r\n");
+            
+            lcd_clear();
+            lcd_set_cursor(0, 0);
+            lcd_print("HELP: 1/0/s/t");
+            lcd_set_cursor(1, 0);
+            lcd_print("h for menu");
+            break;
+            
+        default:
+            // Игнорируем все остальные символы (они уже отфильтрованы в прерывании)
+            break;
+    }
+}
+
+// ============= ОСНОВНАЯ ПРОГРАММА =============
+int main(void) {
+    // Настройка пинов
+    DDRB |= (1 << BUILTIN_LED);      // Встроенный LED как выход
+    EXTERNAL_LED_DDR |= (1 << EXTERNAL_LED_PIN);  // Внешний LED как выход
+    
+    // Инициализация периферии
+    uart_init(9600);
+    i2c_init();
+    lcd_init();
+    
+    // Начальное состояние - LED выключен
+    set_external_led(0);
+    
+    sei();  // Включить прерывания
+    
+    // Приветствие на LCD
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print("UART LED Ctrl");
+    lcd_set_cursor(1, 0);
+    lcd_print("Ready. Press h");
+    
+    // Приветствие в UART
+    uart_send_string("\r\n");
+    uart_send_string("╔════════════════════════╗\r\n");
+    uart_send_string("║  UART LED Control     ║\r\n");
+    uart_send_string("║  External LED on pin 8║\r\n");
+    uart_send_string("║  LCD via I2C          ║\r\n");
+    uart_send_string("╚════════════════════════╝\r\n");
+    uart_send_prompt();
+    
+    while (1) {
+        if (uart_rx_count > 0) {
+            // Получить команду из буфера
+            uint8_t cmd = uart_rx_buffer[uart_rx_tail];
+            uart_rx_tail = (uart_rx_tail + 1) % UART_BUFFER_SIZE;
+            
+            // Атомарно уменьшаем счетчик
+            cli();
+            uart_rx_count--;
+            sei();
+            
+            // Индикация приема на встроенном LED
+            PORTB |= (1 << BUILTIN_LED);
+            _delay_ms(30);
+            PORTB &= ~(1 << BUILTIN_LED);
+            
+            // Обработка команды
+            process_command(cmd);
+            
+            // Новое приглашение
+            uart_send_prompt();
+        }
+        
+        _delay_ms(10);
+    }
+    
+    return 0;
+}
